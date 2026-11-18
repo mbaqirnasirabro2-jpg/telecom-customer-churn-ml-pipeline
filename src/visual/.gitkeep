@@ -1,0 +1,114 @@
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import lightgbm as lgb
+import shap
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score, classification_report, roc_curve
+
+os.makedirs("data", exist_ok=True)
+os.makedirs("visuals", exist_ok=True)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+sns.countplot(data=df, x='contract_type', hue='churn', palette='Set2', ax=axes[0])
+axes[0].set_title("Churn Count by Contract Type", fontweight='bold')
+axes[0].set_xlabel("Contract Type")
+
+sns.boxplot(data=df, x='churn', y='tenure_months', palette='Set1', ax=axes[1])
+axes[1].set_title("Customer Tenure vs. Churn", fontweight='bold')
+axes[1].set_xticklabels(['Retained (0)', 'Churned (1)'])
+
+plt.tight_layout()
+plt.savefig("visuals/churn_eda_overview.png", dpi=300)
+plt.close()
+
+# --- 4. PREPROCESSING & MODEL BENCHMARKING ---
+X = df.drop(columns=['customer_id', 'churn'])
+y = df['churn']
+
+cat_cols = ['contract_type', 'internet_service', 'tech_support', 'payment_method']
+num_cols = [c for c in X.columns if c not in cat_cols]
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', StandardScaler(), num_cols),
+        ('cat', OneHotEncoder(drop='first', sparse_output=False), cat_cols)
+    ]
+)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, stratify=y, random_state=42
+)
+
+models = {
+    "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
+    "Random Forest": RandomForestClassifier(n_estimators=200, max_depth=8, random_state=42),
+    "LightGBM": lgb.LGBMClassifier(n_estimators=300, learning_rate=0.05, num_leaves=31, random_state=42, verbose=-1)
+}
+
+plt.figure(figsize=(8, 6))
+best_model_pipe = None
+best_auc = 0.0
+
+print("[MODEL BENCHMARKING RESULTS]")
+for name, clf in models.items():
+    pipe = Pipeline(steps=[('prep', preprocessor), ('model', clf)])
+    pipe.fit(X_train, y_train)
+    probs = pipe.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, probs)
+    print(f"  -> {name:<20} | Test ROC-AUC: {auc:.4f}")
+
+    fpr, tpr, _ = roc_curve(y_test, probs)
+    plt.plot(fpr, tpr, label=f"{name} (AUC = {auc:.4f})")
+
+    if auc > best_auc:
+        best_auc = auc
+        best_model_pipe = pipe
+
+plt.plot([0, 1], [0, 1], 'k--', alpha=0.5)
+plt.title("Model Comparison: ROC-AUC Curves", fontweight='bold')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.legend(loc="lower right")
+plt.tight_layout()
+plt.savefig("visuals/model_comparison_roc.png", dpi=300)
+plt.close()
+
+# --- 5. SHAP EXPLAINABILITY ON BEST MODEL (LIGHTGBM) ---
+X_test_transformed = best_model_pipe.named_steps['prep'].transform(X_test)
+ohe_feature_names = best_model_pipe.named_steps['prep'].named_transformers_['cat'].get_feature_names_out(cat_cols)
+all_feature_names = num_cols + list(ohe_feature_names)
+
+X_test_df = pd.DataFrame(X_test_transformed, columns=all_feature_names)
+lgb_estimator = best_model_pipe.named_steps['model']
+
+explainer = shap.TreeExplainer(lgb_estimator)
+shap_values = explainer(X_test_df)
+if len(shap_values.shape) == 3:
+    shap_values = shap_values[:, :, 1]
+
+plt.figure(figsize=(10, 6))
+shap.plots.bar(shap_values, show=False)
+plt.title("SHAP Global Feature Importance for Customer Churn", fontweight='bold')
+plt.tight_layout()
+plt.savefig("visuals/shap_feature_importance.png", dpi=300)
+plt.close()
+
+# --- 6. EXPORT HIGH-RISK RETENTION TARGET LIST ---
+test_results = df.loc[X_test.index, ['customer_id', 'contract_type', 'tenure_months', 'monthly_charges']].copy()
+test_results['churn_probability'] = np.round(best_model_pipe.predict_proba(X_test)[:, 1], 4)
+high_risk = test_results[test_results['churn_probability'] >= 0.70].sort_values(by='churn_probability', ascending=False)
+high_risk.to_csv("data/high_risk_retention_targets.csv", index=False)
+
+print(f"\n[BUSINESS IMPACT] Identified {len(high_risk)} high-risk customers (>=70% churn risk).")
+print("[SUCCESS] All datasets, metrics, and 3 visual plots generated successfully!")
